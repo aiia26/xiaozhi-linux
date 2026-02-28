@@ -38,6 +38,7 @@
 #include <iomanip>
 #include <thread>
 #include <unistd.h>
+#include <mutex>
 
 // Include nlohmann/json library
 #include "json.hpp"
@@ -77,6 +78,7 @@ static p_ipc_endpoint_t g_ipc_ep_ui;
 static DeviceState g_device_state = kDeviceStateUnknown;
 static ListeningMode g_listening_mode = kListeningModeAutoStop;
 static volatile int g_tts_stop_pending = 0;
+static std::mutex g_state_mutex;
 
 static bool is_valid_transition(DeviceState from, DeviceState to) {
     switch (from) {
@@ -137,6 +139,28 @@ static void send_stt(const std::string& text)
         g_ipc_ep_ui->send(g_ipc_ep_ui, textString.data(), textString.size());
     } catch (const std::exception& e) {
         std::cerr << "Error creating JSON string: " << e.what() << std::endl;
+    }
+}
+
+/**
+ * WebSocket连接建立回调：若当前为Idle，切换到Connecting状态（重连场景）
+ */
+static void on_ws_connected(void* user_data) {
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    if (g_device_state == kDeviceStateIdle) {
+        set_device_state(kDeviceStateConnecting);
+        send_device_state();
+    }
+}
+
+/**
+ * WebSocket断开回调：停止音频上传并将设备状态切回Idle
+ */
+static void on_ws_disconnected(void* user_data) {
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    g_audio_upload_enable = 0;
+    if (set_device_state(kDeviceStateIdle)) {
+        send_device_state();
     }
 }
 
@@ -609,6 +633,7 @@ int main(int argc, char **argv)
     ws_data.path = "/xiaozhi/v1/";    
 
     websocket_set_callbacks(process_opus_data_downloaded, process_txt_data_downloaded, &ws_data);
+    websocket_set_event_callbacks(on_ws_connected, on_ws_disconnected, nullptr);
     set_device_state(kDeviceStateConnecting);
     send_device_state();
     websocket_start();
