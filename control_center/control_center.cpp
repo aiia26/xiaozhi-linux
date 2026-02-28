@@ -36,6 +36,8 @@
 #include <random>
 #include <sstream>
 #include <iomanip>
+#include <thread>
+#include <unistd.h>
 
 // Include nlohmann/json library
 #include "json.hpp"
@@ -73,10 +75,46 @@ typedef enum DeviceState {
 static p_ipc_endpoint_t g_ipc_ep_audio;
 static p_ipc_endpoint_t g_ipc_ep_ui;
 static DeviceState g_device_state = kDeviceStateUnknown;
+static ListeningMode g_listening_mode = kListeningModeAutoStop;
+static volatile int g_tts_stop_pending = 0;
 
-static void set_device_state(DeviceState state)
+static bool is_valid_transition(DeviceState from, DeviceState to) {
+    switch (from) {
+        case kDeviceStateUnknown:
+            return to == kDeviceStateStarting || to == kDeviceStateIdle;
+        case kDeviceStateStarting:
+            return to == kDeviceStateIdle || to == kDeviceStateWifiConfiguring;
+        case kDeviceStateIdle:
+            return to == kDeviceStateConnecting || to == kDeviceStateListening ||
+                   to == kDeviceStateSpeaking || to == kDeviceStateActivating ||
+                   to == kDeviceStateUpgrading || to == kDeviceStateWifiConfiguring;
+        case kDeviceStateConnecting:
+            return to == kDeviceStateIdle || to == kDeviceStateListening;
+        case kDeviceStateListening:
+            return to == kDeviceStateSpeaking || to == kDeviceStateIdle;
+        case kDeviceStateSpeaking:
+            return to == kDeviceStateListening || to == kDeviceStateIdle;
+        case kDeviceStateActivating:
+            return to == kDeviceStateIdle;
+        case kDeviceStateUpgrading:
+            return to == kDeviceStateIdle || to == kDeviceStateActivating;
+        case kDeviceStateFatalError:
+            return false;
+        default:
+            return true;
+    }
+}
+
+static bool set_device_state(DeviceState state)
 {
+    if (!is_valid_transition(g_device_state, state)) {
+        std::cerr << "[StateMachine] Invalid transition: "
+                  << g_device_state << " -> " << state << std::endl;
+        return false;
+    }
+    std::cout << "[StateMachine] State: " << g_device_state << " -> " << state << std::endl;
     g_device_state = state;
+    return true;
 }
 
 static void send_device_state(void)
@@ -214,6 +252,9 @@ static void process_hello_json(const char *buffer, size_t size)
         {"session_id":"","type":"iot","update":true,"states":[{"name":"Speaker","state":{"volume":80}},{"name":"Backlight","state":{"brightness":75}},{"name":"Battery","state":{"level":0,"charging":false}}]}
     )";
     
+    // 握手成功，状态：Connecting -> Listening
+    set_device_state(kDeviceStateListening);
+    send_device_state();
     g_audio_upload_enable = 1;
 
     try {
@@ -239,24 +280,29 @@ static void process_other_json(const char *buffer, size_t size)
             if (state == "start") {
                 // 下发语音, 可以关闭录音
                 g_audio_upload_enable = 0;
-                set_device_state(kDeviceStateListening);
+                set_device_state(kDeviceStateSpeaking);
                 send_device_state();
             } else if (state == "stop") {
-                // 本次交互结束, 可以继续上传声音
-                // 等待一会以免她听到自己的话误以为再次对话
-                sleep(2);
-                send_start_listening_req(kListeningModeAutoStop);
-                set_device_state(kDeviceStateListening);
-                send_device_state();
-                g_audio_upload_enable = 1;
+                // 在独立线程中延时处理，避免 sleep() 阻塞 WebSocket 回调线程
+                std::thread([]{
+                    if (g_device_state != kDeviceStateSpeaking) return;
+                    usleep(500000);  // 500ms 延时，避免设备听到自己说话
+                    if (g_listening_mode == kListeningModeManualStop) {
+                        set_device_state(kDeviceStateIdle);
+                        send_device_state();
+                    } else {
+                        send_start_listening_req(kListeningModeAutoStop);
+                        set_device_state(kDeviceStateListening);
+                        send_device_state();
+                        g_audio_upload_enable = 1;
+                    }
+                }).detach();
             } else if (state == "sentence_start") {
                 // 取出"text", 通知GUI
                 // {"type":"tts","state":"sentence_start","text":"1加1等于2啦~","session_id":"eae53ada"}
                 auto text = j["text"];
                 send_stt(text.get<std::string>());
-                send_start_listening_req(kListeningModeAutoStop);
-                set_device_state(kDeviceStateSpeaking);
-                send_device_state();
+                // 不在此发送 send_start_listening_req，等 tts stop 后统一处理
             }
         } else if (j["type"] == "stt") {
             // 表示服务器端识别到了用户语音, 取出"text", 通知GUI
@@ -348,6 +394,46 @@ int process_opus_data_uploaded(char *buffer, size_t size, void *user_data)
 
 int process_ui_data(char *buffer, size_t size, void *user_data)
 {
+    try {
+        std::string msg(buffer, size);
+        json j = json::parse(msg);
+        if (j.contains("cmd")) {
+            std::string cmd = j["cmd"];
+            if (cmd == "start_listen") {
+                // GUI 请求开始聆听（如按键触发）
+                if (g_device_state == kDeviceStateIdle ||
+                    g_device_state == kDeviceStateSpeaking) {
+                    g_listening_mode = kListeningModeManualStop;
+                    send_start_listening_req(g_listening_mode);
+                    set_device_state(kDeviceStateListening);
+                    send_device_state();
+                    g_audio_upload_enable = 1;
+                }
+            } else if (cmd == "stop_listen") {
+                // GUI 请求停止聆听
+                if (g_device_state == kDeviceStateListening) {
+                    set_device_state(kDeviceStateIdle);
+                    send_device_state();
+                    g_audio_upload_enable = 0;
+                }
+            } else if (cmd == "abort") {
+                // GUI 请求打断当前播放
+                if (g_device_state == kDeviceStateSpeaking) {
+                    g_audio_upload_enable = 0;
+                    // 发送 abort 指令给服务器
+                    json abort_msg;
+                    abort_msg["session_id"] = g_session_id;
+                    abort_msg["type"] = "abort";
+                    std::string abort_str = abort_msg.dump();
+                    websocket_send_text(abort_str.data(), abort_str.size());
+                    set_device_state(kDeviceStateIdle);
+                    send_device_state();
+                }
+            }
+        }
+    } catch (...) {
+        // 忽略解析错误
+    }
     return 0;
 }
 
@@ -523,6 +609,8 @@ int main(int argc, char **argv)
     ws_data.path = "/xiaozhi/v1/";    
 
     websocket_set_callbacks(process_opus_data_downloaded, process_txt_data_downloaded, &ws_data);
+    set_device_state(kDeviceStateConnecting);
+    send_device_state();
     websocket_start();
 
     while (1)
