@@ -1,0 +1,5 @@
+*.o
+*.d
+.*.o.d
+control_center/control_center
+sound_app/sound_app

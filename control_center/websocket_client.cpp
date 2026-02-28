@@ -55,6 +55,8 @@ static websocketpp::connection_hdl g_hdl;
 static websocket_data_t *g_ws_data;
 static ws_recv_callback_t g_ws_recv_bin_cb;
 static ws_recv_callback_t g_ws_recv_txt_cb;
+static ws_event_callback_t g_ws_disconnect_cb = nullptr;
+static void *g_ws_disconnect_user_data = nullptr;
 static volatile int g_iHasShaked = 0;
 static volatile int g_iHasConnected = 0;
 /**
@@ -278,6 +280,11 @@ static void on_close(client *c, websocketpp::connection_hdl hdl) {
                 
     std::cout << "Connection closed. Code: " << con->get_remote_close_code() << ", Reason: " << con->get_remote_close_reason() << "!!" << std::endl;
 
+    // 通知上层连接已断开（在 websocketpp 回调线程中调用，回调须轻量、非阻塞）
+    if (g_ws_disconnect_cb) {
+        g_ws_disconnect_cb(g_ws_disconnect_user_data);
+    }
+
     // 重新连接逻辑可以在这里实现
     // 例如，等待一段时间后重新启动WebSocket连接
     //std::this_thread::sleep_for(std::chrono::seconds(5)); // 等待5秒后重新连接
@@ -448,6 +455,21 @@ int websocket_set_callbacks(ws_recv_callback_t bin_cb, ws_recv_callback_t txt_cb
     g_ws_recv_bin_cb = bin_cb;
     g_ws_recv_txt_cb = txt_cb;
     g_ws_data = ws_data;
+    return 0;
+}
+
+/**
+ * 注册WebSocket事件回调（如断开连接）
+ *
+ * @param on_disconnected 断开连接时的回调函数，传入 NULL 可清除
+ * @param user_data       回调时透传的用户数据指针
+ * @return 返回值
+ *
+ * 注意：此函数必须在 websocket_start() 之前调用，以避免与回调线程的竞态。
+ */
+int websocket_set_event_callbacks(ws_event_callback_t on_disconnected, void *user_data) {
+    g_ws_disconnect_cb = on_disconnected;
+    g_ws_disconnect_user_data = user_data;
     return 0;
 }
 
