@@ -6,6 +6,9 @@
 // Define the callback function type
 typedef void (*ws_recv_callback_t)(const char *buffer, size_t size);
 
+// WebSocket event callback type (on_connected / on_disconnected)
+typedef void (*ws_event_callback_t)(void* user_data);
+
 typedef struct websocket_data_t {
     std::string hostname;
     std::string port;
@@ -42,8 +45,18 @@ int websocket_send_text(const char *data, int size) ;
 int websocket_set_callbacks(ws_recv_callback_t bin_cb, ws_recv_callback_t txt_cb, websocket_data_t *ws_data);
 
 /**
+ * 设置WebSocket事件回调（连接/断开）
+ *
+ * @param on_connected 连接成功回调（可为nullptr）
+ * @param on_disconnected 连接断开回调（可为nullptr）
+ * @param user_data 传递给回调的用户数据
+ * @return 返回值
+ */
+int websocket_set_event_callbacks(ws_event_callback_t on_connected, ws_event_callback_t on_disconnected, void* user_data);
+
+/**
  * 启动WebSocket线程
- * 
+ *
  * @return 返回值
  */
 int websocket_start() ;

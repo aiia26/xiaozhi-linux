@@ -34,6 +34,11 @@
 #include <vector>
 #include <algorithm>
 #include <dirent.h>
+#include <atomic>
+#include <mutex>
+#include <memory>
+#include <thread>
+#include <chrono>
 
 // Include nlohmann/json library
 #include "json.hpp"
@@ -50,13 +55,19 @@ using websocketpp::lib::bind;
 
 using json = nlohmann::json;
 
-static client* g_p_ws_client;
+static std::shared_ptr<client> g_p_ws_client;
 static websocketpp::connection_hdl g_hdl;
 static websocket_data_t *g_ws_data;
 static ws_recv_callback_t g_ws_recv_bin_cb;
 static ws_recv_callback_t g_ws_recv_txt_cb;
-static volatile int g_iHasShaked = 0;
-static volatile int g_iHasConnected = 0;
+static std::atomic<int> g_iHasShaked{0};
+static std::atomic<int> g_iHasConnected{0};
+static std::mutex g_ws_client_mutex;
+static std::mutex g_ws_event_mutex;
+static std::atomic<bool> g_ws_running{false};
+static ws_event_callback_t g_ws_on_connected_cb = nullptr;
+static ws_event_callback_t g_ws_on_disconnected_cb = nullptr;
+static void* g_ws_event_user_data = nullptr;
 /**
  * 处理接收到的消息
  * 
@@ -235,8 +246,11 @@ static context_ptr on_tls_init(const char * hostname, websocketpp::connection_hd
  * @param hdl 连接句柄
  */
 static void on_open(client* c, websocketpp::connection_hdl hdl) {
-    g_hdl = hdl;
-    g_iHasConnected = 1;
+    {
+        std::lock_guard<std::mutex> lock(g_ws_client_mutex);
+        g_hdl = hdl;
+        g_iHasConnected = 1;
+    }
     websocket_data_t *ws_data = g_ws_data;
 
     std::cout << "Connection opened" << std::endl;
@@ -261,6 +275,17 @@ static void on_open(client* c, websocketpp::connection_hdl hdl) {
     } catch (const websocketpp::lib::error_code& e) {
         std::cout << "Error sending message: " << e << " (" << e.message() << ")" << std::endl;
     }
+
+    ws_event_callback_t cb;
+    void* ud;
+    {
+        std::lock_guard<std::mutex> lock(g_ws_event_mutex);
+        cb = g_ws_on_connected_cb;
+        ud = g_ws_event_user_data;
+    }
+    if (cb) {
+        cb(ud);
+    }
 }
 
 /**
@@ -272,16 +297,50 @@ static void on_open(client* c, websocketpp::connection_hdl hdl) {
  * @param reason 关闭原因
  */
 static void on_close(client *c, websocketpp::connection_hdl hdl) {
-    g_iHasConnected = 0;
-    g_iHasShaked = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_ws_client_mutex);
+        g_iHasConnected = 0;
+        g_iHasShaked = 0;
+    }
     client::connection_ptr con = c->get_con_from_hdl(hdl);
                 
     std::cout << "Connection closed. Code: " << con->get_remote_close_code() << ", Reason: " << con->get_remote_close_reason() << "!!" << std::endl;
 
-    // 重新连接逻辑可以在这里实现
-    // 例如，等待一段时间后重新启动WebSocket连接
-    //std::this_thread::sleep_for(std::chrono::seconds(5)); // 等待5秒后重新连接
-    //websocket_start(); // 重新启动WebSocket线程
+    ws_event_callback_t cb;
+    void* ud;
+    {
+        std::lock_guard<std::mutex> lock(g_ws_event_mutex);
+        cb = g_ws_on_disconnected_cb;
+        ud = g_ws_event_user_data;
+    }
+    if (cb) {
+        cb(ud);
+    }
+}
+
+/**
+ * 处理连接失败事件
+ *
+ * @param c 指向WebSocket客户端的指针
+ * @param hdl 连接句柄
+ */
+static void on_fail(client *c, websocketpp::connection_hdl hdl) {
+    {
+        std::lock_guard<std::mutex> lock(g_ws_client_mutex);
+        g_iHasConnected = 0;
+        g_iHasShaked = 0;
+    }
+    std::cout << "Connection failed." << std::endl;
+    ws_event_callback_t cb;
+    void* ud;
+    {
+        std::lock_guard<std::mutex> lock(g_ws_event_mutex);
+        cb = g_ws_on_disconnected_cb;
+        ud = g_ws_event_user_data;
+    }
+    if (cb) {
+        cb(ud);
+    }
 }
 
 /**
@@ -319,6 +378,9 @@ static int websocket_connect(client *c) {
 
         // 注册连接关闭处理程序
         c->set_close_handler(bind(&on_close, c, ::_1));
+
+        // 注册连接失败处理程序
+        c->set_fail_handler(bind(&on_fail, c, ::_1));
 
         websocketpp::lib::error_code ec;
         client::connection_ptr con = c->get_connection(uri, ec);
@@ -365,25 +427,43 @@ static int websocket_connect(client *c) {
 }
 
 /**
- * WebSocket线程函数
- * 
- * @param arg 参数指针
+ * WebSocket线程函数：单实例循环，连接断开后等待4秒重连
+ *
+ * @param arg 参数指针（未使用）
  * @return 线程返回值
  */
 static void *websocket_thread(void *arg) {
-    client *c = (client *)arg;
- 
-    try {
-        websocket_connect(c);
-         // 启动ASIO io_service运行循环
-         c->run();
-         c->stop();
-         delete c;
-         std::cout<<"exit from websocket_thread"<<std::endl;
-         websocket_start();
-     } catch (websocketpp::exception const & e) {
-         std::cout << "exit hear!" << e.what() << "exit here!!" << std::endl;
-     }
+    while (g_ws_running.load()) {
+        auto c = std::make_shared<client>();
+        {
+            std::lock_guard<std::mutex> lock(g_ws_client_mutex);
+            g_p_ws_client = c;
+        }
+
+        try {
+            int ret = websocket_connect(c.get());
+            if (ret == 0) {
+                // 启动ASIO io_service运行循环，直到连接关闭
+                c->run();
+            }
+        } catch (websocketpp::exception const & e) {
+            std::cout << "websocket_thread exception: " << e.what() << std::endl;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_ws_client_mutex);
+            g_iHasConnected = 0;
+            g_iHasShaked = 0;
+            g_p_ws_client.reset();
+        }
+        // c goes out of scope here and client is safely destroyed
+
+        if (g_ws_running.load()) {
+            std::cout << "Reconnecting in 4 seconds..." << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(4));
+        }
+    }
+    return nullptr;
 }
 
 /**
@@ -394,20 +474,23 @@ static void *websocket_thread(void *arg) {
  * @return 错误码
  */
 int websocket_send_binary(const char *data, int size) {
-    client* c = g_p_ws_client;
-    websocketpp::connection_hdl hdl = g_hdl;
+    std::shared_ptr<client> c;
+    websocketpp::connection_hdl hdl;
 
-    static int cnt = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_ws_client_mutex);
+        if (!g_p_ws_client || !g_iHasConnected || !g_iHasShaked) {
+            return 0;
+        }
+        c = g_p_ws_client;
+        hdl = g_hdl;
+    }
 
     // 发送二进制数据
-    if (g_iHasConnected && g_iHasShaked){
-        //printf("send data cnt  = %d, size = %d\n", cnt++, size);
-        try {
-            c->send(hdl, data, size, websocketpp::frame::opcode::binary);
-        } catch (websocketpp::exception const & e) {
-            std::cout << "exit in websocket_send_binary: " << e.what() << std::endl;
-            websocket_connect(c);
-        }
+    try {
+        c->send(hdl, data, size, websocketpp::frame::opcode::binary);
+    } catch (websocketpp::exception const & e) {
+        std::cout << "exit in websocket_send_binary: " << e.what() << std::endl;
     }
     return 0;
 }
@@ -420,25 +503,31 @@ int websocket_send_binary(const char *data, int size) {
  * @return 错误码
  */
 int websocket_send_text(const char *data, int size) {
-    client* c = g_p_ws_client;
-    websocketpp::connection_hdl hdl = g_hdl;
+    std::shared_ptr<client> c;
+    websocketpp::connection_hdl hdl;
+
+    {
+        std::lock_guard<std::mutex> lock(g_ws_client_mutex);
+        if (!g_p_ws_client || !g_iHasConnected) {
+            return 0;
+        }
+        c = g_p_ws_client;
+        hdl = g_hdl;
+    }
 
     // 发送文本数据
-    if (g_iHasConnected){
-        try {
-            c->send(hdl, data, size, websocketpp::frame::opcode::text);
-        } catch (websocketpp::exception const & e) {
-            std::cout << "exit in websocket_send_text: " << e.what() << std::endl;
-            websocket_connect(c);
-        }
+    try {
+        c->send(hdl, data, size, websocketpp::frame::opcode::text);
         g_iHasShaked = 1;
+    } catch (websocketpp::exception const & e) {
+        std::cout << "exit in websocket_send_text: " << e.what() << std::endl;
     }
     return 0;
 }
 
 /**
  * 设置回调函数和数据
- * 
+ *
  * @param bin_cb 二进制数据接收回调
  * @param txt_cb 文本数据接收回调
  * @param ws_data WebSocket数据
@@ -452,17 +541,33 @@ int websocket_set_callbacks(ws_recv_callback_t bin_cb, ws_recv_callback_t txt_cb
 }
 
 /**
- * 启动WebSocket线程
- * 
+ * 设置WebSocket事件回调（连接/断开）
+ *
+ * @param on_connected 连接成功回调（可为nullptr）
+ * @param on_disconnected 连接断开回调（可为nullptr）
+ * @param user_data 传递给回调的用户数据
+ * @return 返回值
+ */
+int websocket_set_event_callbacks(ws_event_callback_t on_connected, ws_event_callback_t on_disconnected, void* user_data) {
+    std::lock_guard<std::mutex> lock(g_ws_event_mutex);
+    g_ws_on_connected_cb = on_connected;
+    g_ws_on_disconnected_cb = on_disconnected;
+    g_ws_event_user_data = user_data;
+    return 0;
+}
+
+/**
+ * 启动WebSocket线程（单实例保护，只能同时运行一个连接线程）
+ *
  * @return 返回值
  */
 int websocket_start() {
-    g_p_ws_client = new client();
-    // 创建并启动线程 websocket_thread
-    std::thread ws_thread(websocket_thread, g_p_ws_client);
-
-    // 将线程分离，使其在后台运行
+    bool expected = false;
+    if (!g_ws_running.compare_exchange_strong(expected, true)) {
+        // 已有连接线程在运行，忽略重复调用
+        return 0;
+    }
+    std::thread ws_thread(websocket_thread, nullptr);
     ws_thread.detach();
-
     return 0;
 }
