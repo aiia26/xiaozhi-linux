@@ -37,6 +37,7 @@
 #include <sstream>
 #include <iomanip>
 #include <thread>
+#include <mutex>
 #include <unistd.h>
 
 // Include nlohmann/json library
@@ -77,6 +78,10 @@ static p_ipc_endpoint_t g_ipc_ep_ui;
 static DeviceState g_device_state = kDeviceStateUnknown;
 static ListeningMode g_listening_mode = kListeningModeAutoStop;
 static volatile int g_tts_stop_pending = 0;
+// 用于保护断开回调（websocket 线程）对 g_device_state 和 UI 通知的并发访问。
+// 注意：其他状态转换（同在主线程或其 detach 线程中执行）暂不统一加锁，
+// 如后续需要全局线程安全可将所有 set_device_state/send_device_state 调用纳入此锁。
+static std::mutex g_state_mutex;
 
 static bool is_valid_transition(DeviceState from, DeviceState to) {
     switch (from) {
@@ -497,6 +502,20 @@ bool write_uuid_to_config(const std::string& uuid) {
     return false;
 }
 
+/**
+ * WebSocket 断开事件回调
+ * 由 websocket 线程触发，需轻量、非阻塞。
+ * 将设备状态切回 Idle 并通知 UI，同时停止音频上传。
+ */
+static void on_websocket_disconnected(void * /*user_data*/) {
+    std::lock_guard<std::mutex> lock(g_state_mutex);
+    std::cout << "[WebSocket] Disconnected — resetting state to Idle" << std::endl;
+    g_audio_upload_enable = 0;
+    if (set_device_state(kDeviceStateIdle)) {
+        send_device_state();
+    }
+}
+
 int main(int argc, char **argv)
 {
     char active_code[20] = "";
@@ -609,6 +628,7 @@ int main(int argc, char **argv)
     ws_data.path = "/xiaozhi/v1/";    
 
     websocket_set_callbacks(process_opus_data_downloaded, process_txt_data_downloaded, &ws_data);
+    websocket_set_event_callbacks(on_websocket_disconnected, nullptr);
     set_device_state(kDeviceStateConnecting);
     send_device_state();
     websocket_start();
